@@ -58,3 +58,8 @@
 
 - adapt QNN_TENSOR_VERSION_2
 - Contributors👉 Na Song
+
+## 2.0.0 (2026-01-07)
+
+- update readme
+- Contributors👉 Na Song
