@@ -27,6 +27,13 @@ void QRB_WARNING(Args &&... args)
 }
 
 template <typename... Args>
+void QRB_DEBUG(Args &&... args)
+{
+  std::cout << "\033[34m[QRB DEBUG] \033[0m";
+  (std::cout << ... << args) << std::endl;
+}
+
+template <typename... Args>
 void QRB_ERROR(Args &&... args)
 {
   std::cout << "\033[31m[QRB ERROR] \033[0m";

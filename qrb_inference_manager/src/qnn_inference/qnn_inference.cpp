@@ -3,8 +3,176 @@
 
 #include "qnn_inference/qnn_inference.hpp"
 
+#include <fcntl.h>
+#include <unistd.h>
+
+#include <cstdint>
+#include <unordered_map>
+
+#include "QnnContext.h"
+#include "lib_mem_dmabuf/dmabuf.hpp"
+
 namespace qrb::inference_mgr
 {
+
+// callback notifyParam：为避免访问 QnnInference private 嵌套类型导致编译失败，
+// 该结构体定义为本 .cpp 文件的“私有实现细节”，并由 QnnInference 以 void* 形式持有。
+struct ContextBinaryCallbackCtx {
+  int model_fd = -1;
+
+  struct DmaAllocation {
+    std::shared_ptr<lib_mem_dmabuf::DmaBuffer> buf;
+    uint64_t aligned_size = 0;
+  };
+
+  // key: dma fd（QNN 回调要求每次返回 distinct fd）
+  std::unordered_map<int, DmaAllocation> dmabufs;
+
+  // ---- verification / instrumentation ----
+  uint64_t total_allocated_bytes = 0;   // sum(aligned_size) over provider calls
+  uint64_t max_single_alloc_bytes = 0;  // max(aligned_size)
+  uint32_t num_allocs = 0;              // number of provider calls
+  uint64_t total_requested_bytes = 0;   // sum(req.size)
+};
+
+namespace {
+
+static constexpr uint64_t kPageSize = 4096;
+static inline uint64_t align_up(uint64_t v, uint64_t align) {
+  return (v + align - 1) / align * align;
+}
+
+static constexpr const char* kDefaultDmaHeap = "/dev/dma_heap/system";
+
+static bool allocate_dmabuf(uint64_t size,
+                            ContextBinaryCallbackCtx::DmaAllocation* outAlloc,
+                            Qnn_MemDmaBufInfo_t* outQnnDmaBuf) {
+  if (!outAlloc || !outQnnDmaBuf || size == 0) {
+    return false;
+  }
+
+  const uint64_t alignedSize = align_up(size, kPageSize);
+
+  auto buf = lib_mem_dmabuf::DmaBuffer::alloc(alignedSize, kDefaultDmaHeap);
+  if (!buf) {
+    return false;
+  }
+  if (!buf->map()) {
+    return false;
+  }
+
+  outAlloc->buf = buf;
+  outAlloc->aligned_size = alignedSize;
+
+  outQnnDmaBuf->fd = buf->fd();
+  outQnnDmaBuf->data = buf->addr();
+  return true;
+}
+
+static void free_dmabuf(ContextBinaryCallbackCtx::DmaAllocation& alloc) {
+  if (!alloc.buf) {
+    return;
+  }
+  // DmaBuffer::~DmaBuffer 会在 auto_release_==true 时 close(fd) + unmap
+  alloc.buf.reset();
+  alloc.aligned_size = 0;
+}
+
+
+/*
+1. 申请DMA buffer并mmap成CPU地址
+2. 将model.bin中的数据读入
+*/
+static Qnn_ErrorHandle_t dma_data_provider(Qnn_ContextBinaryDataRequest_t req,
+                                          Qnn_ContextBinaryDmaDataResponse_t* resp,
+                                          void* notifyParam) {
+  if (!resp || !notifyParam || req.size == 0) {
+    return QNN_CONTEXT_ERROR_INVALID_ARGUMENT;
+  }
+
+  auto* ctx = reinterpret_cast<ContextBinaryCallbackCtx*>(notifyParam);
+
+  const uint64_t alignedSize = align_up(static_cast<uint64_t>(req.size), kPageSize);
+
+  Qnn_MemDmaBufInfo_t dmaBuf{}; //存放了DMA Buffer fd
+  ContextBinaryCallbackCtx::DmaAllocation alloc{};
+  if (!allocate_dmabuf(alignedSize, &alloc, &dmaBuf) || dmaBuf.fd < 0 || dmaBuf.data == nullptr) {
+    return QNN_CONTEXT_ERROR_MEM_ALLOC;
+  }
+
+  // Instrumentation: prove DMA-BUF allocation succeeded and record sizes.
+  // - dmaBuf.fd: should be a dmabuf fd (often shows as anon_inode:dmabuf in /proc/<pid>/fd)
+  // - dmaBuf.data: mmap'ed CPU-visible address
+  // - alloc.aligned_size: actual allocated bytes (>= req.size, 4KB aligned)
+  ctx->num_allocs++;
+  ctx->total_requested_bytes += static_cast<uint64_t>(req.size);
+  ctx->total_allocated_bytes += alloc.aligned_size;
+  if (alloc.aligned_size > ctx->max_single_alloc_bytes) {
+    ctx->max_single_alloc_bytes = alloc.aligned_size;
+  }
+
+  QRB_DEBUG("[QNN-DMABUF] provider: req{off=",
+            static_cast<uint64_t>(req.offset),
+            ",size=",
+            static_cast<uint64_t>(req.size),
+            ",map=",
+            static_cast<unsigned>(req.isBackendMappingNeeded),
+            "} -> dmabuf{fd=",
+            dmaBuf.fd,
+            ",addr=",
+            dmaBuf.data,
+            ",alloc=",
+            static_cast<uint64_t>(alloc.aligned_size),
+            "}");
+
+  // 按照QNN SDK文档的建议，令dataStartOffset=0，避免后端 mapping 对 offset 的限制
+  const uint64_t dataStartOffset = 0;
+
+  // 同步把 binary 的指定分段读到 DMA buffer
+  ssize_t bytesRead = ::pread(ctx->model_fd,
+                              static_cast<uint8_t*>(dmaBuf.data) + dataStartOffset,
+                              static_cast<size_t>(req.size),
+                              static_cast<off_t>(req.offset));
+  if (bytesRead != static_cast<ssize_t>(req.size)) {
+    free_dmabuf(alloc);
+    return QNN_CONTEXT_ERROR_CREATE_FROM_BINARY;
+  }
+
+  resp->dmaBuffer = dmaBuf;
+  resp->dataStartOffset = static_cast<Qnn_ContextBinarySize_t>(dataStartOffset);
+  resp->alignedSize = static_cast<Qnn_ContextBinarySize_t>(alloc.aligned_size);
+
+  ctx->dmabufs.emplace(dmaBuf.fd, std::move(alloc));
+  return QNN_SUCCESS;
+}
+
+static Qnn_ErrorHandle_t dma_data_release(Qnn_ContextBinaryDmaDataMem_t mem, void* notifyParam) {
+  if (!notifyParam) {
+    return QNN_CONTEXT_ERROR_INVALID_ARGUMENT;
+  }
+
+  auto* ctx = reinterpret_cast<ContextBinaryCallbackCtx*>(notifyParam);
+  const int fd = mem.dmaBuffer.fd;
+
+  QRB_DEBUG("[QNN-DMABUF] release: dmabuf{fd=",
+            fd,
+            ",memSize=",
+            static_cast<uint64_t>(mem.memSize),
+            "} (tracked=",
+            ctx->dmabufs.size(),
+            ")");
+
+  auto it = ctx->dmabufs.find(fd);
+  if (it == ctx->dmabufs.end()) {
+    return QNN_CONTEXT_ERROR_INVALID_ARGUMENT;
+  }
+
+  free_dmabuf(it->second);
+  ctx->dmabufs.erase(it);
+  return QNN_SUCCESS;
+}
+
+}  // namespace
 
 QnnInference::QnnInference(const std::string & model_path, const std::string & backend_option)
   : model_path_(model_path), backend_option_(backend_option)
@@ -239,11 +407,30 @@ void QnnInference::free_graphs_info()
 
 void QnnInference::free_context()
 {
-  if (QNN_CONTEXT_NO_ERROR != qnn_interface_->interface.contextFree(context_, nullptr)) {
-    QRB_ERROR("Failed to free context!");
+  if (context_ != nullptr) {
+    if (QNN_CONTEXT_NO_ERROR != qnn_interface_->interface.contextFree(context_, nullptr)) {
+      QRB_ERROR("Failed to free context!");
+    }
+    context_ = nullptr;
   }
 
-  context_ = nullptr;
+  // 释放 callback 相关资源（仅 binary 模型 + HTP + WithCallback 路径会分配）
+  if (context_binary_cb_ctx_) {
+    auto* ctx = reinterpret_cast<ContextBinaryCallbackCtx*>(context_binary_cb_ctx_.get());
+
+    if (ctx->model_fd >= 0) {
+      ::close(ctx->model_fd);
+      ctx->model_fd = -1;
+    }
+
+    // 正常情况下 QNN 会在 contextFree 过程中触发 dma_data_release，把 dmabufs 清空；
+    // 这里保留兜底，防止异常路径泄漏。
+    for (auto& kv : ctx->dmabufs) {
+      free_dmabuf(kv.second);
+    }
+    ctx->dmabufs.clear();
+    context_binary_cb_ctx_.reset();
+  }
 }
 
 void QnnInference::free_device()
@@ -453,10 +640,85 @@ StatusCode QnnInference::set_up_graph_info(const QnnSystemContext_BinaryInfo_t *
 StatusCode QnnInference::create_context_from_binary(const std::shared_ptr<uint8_t[]> model_buf,
     const uint64_t model_buf_size)
 {
-  if (qnn_interface_->interface.contextCreateFromBinary(backend_handle_, device_handle_, nullptr,
-          static_cast<void *>(model_buf.get()), model_buf_size, &context_, nullptr)) {
-    QRB_ERROR("Could not create context from binary!");
-    return StatusCode::FAILURE;
+  const bool is_htp_backend = (backend_option_.find("HTP") != std::string::npos);
+
+  if (!is_htp_backend || !enable_context_create_callback_|| qnn_interface_->interface.contextCreateFromBinaryWithCallback == nullptr) {
+    if (qnn_interface_->interface.contextCreateFromBinary(backend_handle_, device_handle_, nullptr,
+            static_cast<void *>(model_buf.get()), model_buf_size, &context_, nullptr)) {
+      QRB_ERROR("Could not create context from binary!");
+      return StatusCode::FAILURE;
+    }
+  } else {
+    // HTP 优化路径：createFromBinaryWithCallback（external weights-loaded buffer）
+    // NOTE:
+    // - callback 依赖 DMA-BUF allocator；本仓库不引入平台 allocator，实现留在 allocate_dmabuf()
+    // - notifyParam 必须在 contextFree 前保持有效，因此保存到成员 context_binary_cb_ctx_
+    auto* rawCtx = new ContextBinaryCallbackCtx();
+    rawCtx->model_fd = ::open(model_path_.c_str(), O_RDONLY);
+    if (rawCtx->model_fd < 0) {
+      QRB_ERROR("Fail to open model file for callback provider: ", model_path_);
+      delete rawCtx;
+      return StatusCode::FAILURE;
+    }
+
+    // 用 unique_ptr<void,deleter> 持有，保证 notifyParam 生命周期覆盖 contextFree。
+    context_binary_cb_ctx_ = std::unique_ptr<void, void (*)(void*)>(
+        rawCtx, [](void* p) { delete reinterpret_cast<ContextBinaryCallbackCtx*>(p); });
+
+    Qnn_ContextBinaryCallback_t callback{};
+    callback.type = QNN_CONTEXT_CALLBACK_DMA_BUFFER;
+    callback.dmaBufferCallback.version = QNN_CONTEXT_CALLBACK_DMA_BUFFER_VERSION_1;
+    callback.dmaBufferCallback.v1.dataProvide = dma_data_provider;
+    callback.dmaBufferCallback.v1.dataRelease = dma_data_release;
+    callback.dmaBufferCallback.v1.notifyParam = rawCtx;
+
+    Qnn_SignalHandle_t signal = nullptr;
+    const Qnn_ErrorHandle_t err = qnn_interface_->interface.contextCreateFromBinaryWithCallback(
+        backend_handle_,
+        device_handle_,
+        nullptr,
+        &callback,
+        static_cast<void *>(model_buf.get()),
+        model_buf_size,
+        &context_,
+        nullptr,
+        signal);
+
+    if (err != QNN_SUCCESS) {
+      // create 失败时，QNN 未必触发 release 回调：做兜底释放
+      auto* failCtx = reinterpret_cast<ContextBinaryCallbackCtx*>(context_binary_cb_ctx_.get());
+      for (auto& kv : failCtx->dmabufs) {
+        free_dmabuf(kv.second);
+      }
+      failCtx->dmabufs.clear();
+      ::close(failCtx->model_fd);
+
+      QRB_DEBUG("[QNN-DMABUF] create failed: reqTotal=",
+                static_cast<uint64_t>(failCtx->total_requested_bytes),
+                " allocTotal=",
+                static_cast<uint64_t>(failCtx->total_allocated_bytes),
+                " maxAlloc=",
+                static_cast<uint64_t>(failCtx->max_single_alloc_bytes),
+                " numAllocs=",
+                static_cast<unsigned>(failCtx->num_allocs));
+
+      context_binary_cb_ctx_.reset();
+
+      QRB_ERROR("Could not create context from binary with callback! err=", err);
+      return StatusCode::FAILURE;
+    }
+
+    // create 成功后打印统计信息，便于验证：
+    // 1) 是否真的分配了 DMA-BUF（numAllocs>0 且 fd/addr 在 provider 日志中出现）
+    // 2) 分配总量/最大单块是多少
+    QRB_DEBUG("[QNN-DMABUF] create ok: reqTotal=",
+              static_cast<uint64_t>(rawCtx->total_requested_bytes),
+              " allocTotal=",
+              static_cast<uint64_t>(rawCtx->total_allocated_bytes),
+              " maxAlloc=",
+              static_cast<uint64_t>(rawCtx->max_single_alloc_bytes),
+              " numAllocs=",
+              static_cast<unsigned>(rawCtx->num_allocs));
   }
 
   for (uint32_t i = 0; i < graphs_count_; i++) {
