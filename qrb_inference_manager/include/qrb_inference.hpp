@@ -52,10 +52,15 @@ enum class StatusCode
 
 struct OutputTensor
 {
+  // When output_dmabuf_fd >= 0, output_tensor_data may be empty and output is stored in DMA-BUF.
   std::vector<uint8_t> output_tensor_data;
   std::string output_tensor_name;
   std::vector<uint32_t> output_tensor_shape;
   int32_t data_type;
+
+  int output_dmabuf_fd{ -1 };
+  uint32_t output_dmabuf_size{ 0 };
+  uint64_t output_dmabuf_offset{ 0 };
 };
 
 class QrbInference

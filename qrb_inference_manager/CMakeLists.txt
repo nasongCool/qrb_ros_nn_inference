@@ -26,9 +26,6 @@ set(SOURCES
 ament_auto_add_library(qrb_inference_manager SHARED ${SOURCES})
 target_link_libraries(qrb_inference_manager tensorflowlite_c QnnTFLiteDelegate)
 
-# For QnnContext_createFromBinaryWithCallback (HTP) DMA-BUF path
-ament_target_dependencies(qrb_inference_manager lib_mem_dmabuf)
-
 set_target_properties(
   qrb_inference_manager PROPERTIES
   VERSION ${PROJECT_VERSION}

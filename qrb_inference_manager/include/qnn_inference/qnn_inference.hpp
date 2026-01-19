@@ -7,8 +7,6 @@
 #include "qnn_inference/qnn_inference_impl.hpp"
 #include "qrb_inference.hpp"
 
-#include <memory>
-
 namespace qrb::inference_mgr
 {
 
@@ -20,6 +18,7 @@ public:
   StatusCode inference_init() override;
   StatusCode inference_graph_init() override;
   StatusCode inference_execute(const std::vector<uint8_t> & input_tensor_data) override;
+  StatusCode inference_execute_dmabuf(int dmabuf_fd, uint32_t dmabuf_size, uint64_t dmabuf_offset);
   const std::vector<OutputTensor> get_output_tensors() override;
 
 private:
@@ -38,11 +37,6 @@ private:
   bool support_device_ = false;
   std::vector<OutputTensor> output_tensor_;
   std::unique_ptr<QnnInterface> qnn_interface_{ nullptr };
-
-  // 生命周期需要覆盖 context 存活期：QNN 会在 contextFree 期间调用 dataRelease 回调。
-  // 具体类型在 .cpp 中定义（实现细节），这里用 void* 避免访问控制/头文件依赖问题。
-  std::unique_ptr<void, void (*)(void*)> context_binary_cb_ctx_{nullptr, nullptr};
-  bool enable_context_create_callback_{true};
 
   StatusCode initialize_backend();
   StatusCode create_device();

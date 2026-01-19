@@ -3,176 +3,8 @@
 
 #include "qnn_inference/qnn_inference.hpp"
 
-#include <fcntl.h>
-#include <unistd.h>
-
-#include <cstdint>
-#include <unordered_map>
-
-#include "QnnContext.h"
-#include "lib_mem_dmabuf/dmabuf.hpp"
-
 namespace qrb::inference_mgr
 {
-
-// callback notifyParam：为避免访问 QnnInference private 嵌套类型导致编译失败，
-// 该结构体定义为本 .cpp 文件的“私有实现细节”，并由 QnnInference 以 void* 形式持有。
-struct ContextBinaryCallbackCtx {
-  int model_fd = -1;
-
-  struct DmaAllocation {
-    std::shared_ptr<lib_mem_dmabuf::DmaBuffer> buf;
-    uint64_t aligned_size = 0;
-  };
-
-  // key: dma fd（QNN 回调要求每次返回 distinct fd）
-  std::unordered_map<int, DmaAllocation> dmabufs;
-
-  // ---- verification / instrumentation ----
-  uint64_t total_allocated_bytes = 0;   // sum(aligned_size) over provider calls
-  uint64_t max_single_alloc_bytes = 0;  // max(aligned_size)
-  uint32_t num_allocs = 0;              // number of provider calls
-  uint64_t total_requested_bytes = 0;   // sum(req.size)
-};
-
-namespace {
-
-static constexpr uint64_t kPageSize = 4096;
-static inline uint64_t align_up(uint64_t v, uint64_t align) {
-  return (v + align - 1) / align * align;
-}
-
-static constexpr const char* kDefaultDmaHeap = "/dev/dma_heap/system";
-
-static bool allocate_dmabuf(uint64_t size,
-                            ContextBinaryCallbackCtx::DmaAllocation* outAlloc,
-                            Qnn_MemDmaBufInfo_t* outQnnDmaBuf) {
-  if (!outAlloc || !outQnnDmaBuf || size == 0) {
-    return false;
-  }
-
-  const uint64_t alignedSize = align_up(size, kPageSize);
-
-  auto buf = lib_mem_dmabuf::DmaBuffer::alloc(alignedSize, kDefaultDmaHeap);
-  if (!buf) {
-    return false;
-  }
-  if (!buf->map()) {
-    return false;
-  }
-
-  outAlloc->buf = buf;
-  outAlloc->aligned_size = alignedSize;
-
-  outQnnDmaBuf->fd = buf->fd();
-  outQnnDmaBuf->data = buf->addr();
-  return true;
-}
-
-static void free_dmabuf(ContextBinaryCallbackCtx::DmaAllocation& alloc) {
-  if (!alloc.buf) {
-    return;
-  }
-  // DmaBuffer::~DmaBuffer 会在 auto_release_==true 时 close(fd) + unmap
-  alloc.buf.reset();
-  alloc.aligned_size = 0;
-}
-
-
-/*
-1. 申请DMA buffer并mmap成CPU地址
-2. 将model.bin中的数据读入
-*/
-static Qnn_ErrorHandle_t dma_data_provider(Qnn_ContextBinaryDataRequest_t req,
-                                          Qnn_ContextBinaryDmaDataResponse_t* resp,
-                                          void* notifyParam) {
-  if (!resp || !notifyParam || req.size == 0) {
-    return QNN_CONTEXT_ERROR_INVALID_ARGUMENT;
-  }
-
-  auto* ctx = reinterpret_cast<ContextBinaryCallbackCtx*>(notifyParam);
-
-  const uint64_t alignedSize = align_up(static_cast<uint64_t>(req.size), kPageSize);
-
-  Qnn_MemDmaBufInfo_t dmaBuf{}; //存放了DMA Buffer fd
-  ContextBinaryCallbackCtx::DmaAllocation alloc{};
-  if (!allocate_dmabuf(alignedSize, &alloc, &dmaBuf) || dmaBuf.fd < 0 || dmaBuf.data == nullptr) {
-    return QNN_CONTEXT_ERROR_MEM_ALLOC;
-  }
-
-  // Instrumentation: prove DMA-BUF allocation succeeded and record sizes.
-  // - dmaBuf.fd: should be a dmabuf fd (often shows as anon_inode:dmabuf in /proc/<pid>/fd)
-  // - dmaBuf.data: mmap'ed CPU-visible address
-  // - alloc.aligned_size: actual allocated bytes (>= req.size, 4KB aligned)
-  ctx->num_allocs++;
-  ctx->total_requested_bytes += static_cast<uint64_t>(req.size);
-  ctx->total_allocated_bytes += alloc.aligned_size;
-  if (alloc.aligned_size > ctx->max_single_alloc_bytes) {
-    ctx->max_single_alloc_bytes = alloc.aligned_size;
-  }
-
-  QRB_DEBUG("[QNN-DMABUF] provider: req{off=",
-            static_cast<uint64_t>(req.offset),
-            ",size=",
-            static_cast<uint64_t>(req.size),
-            ",map=",
-            static_cast<unsigned>(req.isBackendMappingNeeded),
-            "} -> dmabuf{fd=",
-            dmaBuf.fd,
-            ",addr=",
-            dmaBuf.data,
-            ",alloc=",
-            static_cast<uint64_t>(alloc.aligned_size),
-            "}");
-
-  // 按照QNN SDK文档的建议，令dataStartOffset=0，避免后端 mapping 对 offset 的限制
-  const uint64_t dataStartOffset = 0;
-
-  // 同步把 binary 的指定分段读到 DMA buffer
-  ssize_t bytesRead = ::pread(ctx->model_fd,
-                              static_cast<uint8_t*>(dmaBuf.data) + dataStartOffset,
-                              static_cast<size_t>(req.size),
-                              static_cast<off_t>(req.offset));
-  if (bytesRead != static_cast<ssize_t>(req.size)) {
-    free_dmabuf(alloc);
-    return QNN_CONTEXT_ERROR_CREATE_FROM_BINARY;
-  }
-
-  resp->dmaBuffer = dmaBuf;
-  resp->dataStartOffset = static_cast<Qnn_ContextBinarySize_t>(dataStartOffset);
-  resp->alignedSize = static_cast<Qnn_ContextBinarySize_t>(alloc.aligned_size);
-
-  ctx->dmabufs.emplace(dmaBuf.fd, std::move(alloc));
-  return QNN_SUCCESS;
-}
-
-static Qnn_ErrorHandle_t dma_data_release(Qnn_ContextBinaryDmaDataMem_t mem, void* notifyParam) {
-  if (!notifyParam) {
-    return QNN_CONTEXT_ERROR_INVALID_ARGUMENT;
-  }
-
-  auto* ctx = reinterpret_cast<ContextBinaryCallbackCtx*>(notifyParam);
-  const int fd = mem.dmaBuffer.fd;
-
-  QRB_DEBUG("[QNN-DMABUF] release: dmabuf{fd=",
-            fd,
-            ",memSize=",
-            static_cast<uint64_t>(mem.memSize),
-            "} (tracked=",
-            ctx->dmabufs.size(),
-            ")");
-
-  auto it = ctx->dmabufs.find(fd);
-  if (it == ctx->dmabufs.end()) {
-    return QNN_CONTEXT_ERROR_INVALID_ARGUMENT;
-  }
-
-  free_dmabuf(it->second);
-  ctx->dmabufs.erase(it);
-  return QNN_SUCCESS;
-}
-
-}  // namespace
 
 QnnInference::QnnInference(const std::string & model_path, const std::string & backend_option)
   : model_path_(model_path), backend_option_(backend_option)
@@ -299,6 +131,429 @@ StatusCode QnnInference::inference_execute(const std::vector<uint8_t> & input_te
   return StatusCode::SUCCESS;
 }
 
+StatusCode QnnInference::inference_execute_dmabuf(
+    int dmabuf_fd, uint32_t dmabuf_size, uint64_t dmabuf_offset)
+{
+  // Static variable to track previous output handles for cleanup
+  static std::vector<Qnn_MemHandle_t> prev_output_handles;
+
+  if (dmabuf_fd < 0 || dmabuf_size == 0) {
+    QRB_ERROR("Invalid DMA-BUF input: fd=", dmabuf_fd, " size=", dmabuf_size);
+    return StatusCode::FAILURE;
+  }
+
+  // Clean up previous output handles before starting new inference
+  if (!prev_output_handles.empty()) {
+    QRB_DEBUG("Cleaning up ", prev_output_handles.size(), " previous output handles");
+    for (auto & handle : prev_output_handles) {
+      if (handle != nullptr) {
+        qnn_interface_->interface.memDeRegister(&handle, 1u);
+      }
+    }
+    prev_output_handles.clear();
+  }
+
+  for (uint32_t g = 0; g < graphs_count_; g++) {
+    const auto & graph_info = (*(graphs_info_))[g];
+
+    // Current implementation supports single input tensor (common for the provided ROS sample).
+    // Extending to multi-input requires offset/size per tensor.
+    if (graph_info.num_of_input_tensors != 1) {
+      QRB_ERROR("DMA-BUF input path currently supports single input tensor only. num_inputs=",
+          graph_info.num_of_input_tensors);
+      return StatusCode::FAILURE;
+    }
+
+    auto io_tensors = QnnTensor(graph_info.num_of_input_tensors, graph_info.num_of_output_tensors);
+
+    if (StatusCode::SUCCESS != io_tensors.setup_tensors(io_tensors.inputs,
+                                   io_tensors.num_of_input_tensors, graph_info.input_tensors)) {
+      QRB_ERROR("Setup input tensors failed!");
+      return StatusCode::FAILURE;
+    }
+
+    if (StatusCode::SUCCESS != io_tensors.setup_tensors(io_tensors.outputs,
+                                   io_tensors.num_of_output_tensors, graph_info.output_tensors)) {
+      QRB_ERROR("Setup output tensors failed!");
+      return StatusCode::FAILURE;
+    }
+
+    // Load RPCMEM APIs first
+    void * libCdspHandle = ::dlopen("libcdsprpc.so", RTLD_NOW | RTLD_LOCAL);
+    if (nullptr == libCdspHandle) {
+      QRB_ERROR("dlopen(libcdsprpc.so) failed");
+      return StatusCode::FAILURE;
+    }
+
+    using RpcMemAllocFn_t = void * (*)(int, uint32_t, int);
+    using RpcMemFreeFn_t = void (*)(void *);
+    using RpcMemToFdFn_t = int (*)(void *);
+
+    auto rpcmem_alloc = (RpcMemAllocFn_t)::dlsym(libCdspHandle, "rpcmem_alloc");
+    auto rpcmem_free = (RpcMemFreeFn_t)::dlsym(libCdspHandle, "rpcmem_free");
+    auto rpcmem_to_fd = (RpcMemToFdFn_t)::dlsym(libCdspHandle, "rpcmem_to_fd");
+
+    if (nullptr == rpcmem_alloc || nullptr == rpcmem_free || nullptr == rpcmem_to_fd) {
+      ::dlclose(libCdspHandle);
+      QRB_ERROR("resolve rpcmem symbols failed");
+      return StatusCode::FAILURE;
+    }
+
+    // Note: rpcmem_init() should have been called by the process already
+    // (e.g., by depth_estimation_node in the same process).
+    // Calling it multiple times in the same process may cause issues.
+
+    // Register input shared buffer as ION (RPCMEM-backed fd).
+    // This is the recommended and widely supported path for HTP shared buffers.
+    Qnn_MemDescriptor_t input_mem_desc = QNN_MEM_DESCRIPTOR_INIT;
+
+    input_mem_desc.memShape = {io_tensors.inputs[0].v1.rank, io_tensors.inputs[0].v1.dimensions, nullptr};
+    input_mem_desc.dataType = io_tensors.inputs[0].v1.dataType;
+    input_mem_desc.memType = QNN_MEM_TYPE_ION;
+    input_mem_desc.ionInfo.fd = dmabuf_fd;
+
+    Qnn_MemHandle_t input_mem_handle = nullptr;
+    auto rc = qnn_interface_->interface.memRegister(context_, &input_mem_desc, 1u, &input_mem_handle);
+    if (QNN_SUCCESS != rc) {
+      const char * err_msg = nullptr;
+      qnn_interface_->interface.errorGetMessage(rc, &err_msg);
+      QRB_ERROR("memRegister(input DMA-BUF) failed: ", (err_msg ? err_msg : "unknown"), " (", rc, ")");
+      ::dlclose(libCdspHandle);
+      return StatusCode::FAILURE;
+    }
+
+    // ! Bind memhandle to input tensor, so that QNN runtime will use it as model input data
+    io_tensors.inputs[0].v1.memType = QNN_TENSORMEMTYPE_MEMHANDLE;
+    io_tensors.inputs[0].v1.memHandle = input_mem_handle;
+
+    // Register each output tensor as its own ION buffer (rpcmem-backed) to get a distinct fd.
+    std::vector<Qnn_MemHandle_t> output_mem_handles(graph_info.num_of_output_tensors, nullptr);
+    std::vector<void *> output_rpc_ptrs(graph_info.num_of_output_tensors, nullptr);
+    std::vector<int> output_fds(graph_info.num_of_output_tensors, -1);
+
+    constexpr int RPCMEM_HEAP_ID_SYSTEM = 25;
+    constexpr uint32_t RPCMEM_DEFAULT_FLAGS = 1;
+
+    auto cleanup_outputs = [&] {
+      for (uint32_t i = 0; i < graph_info.num_of_output_tensors; i++) {
+        if (output_mem_handles[i] != nullptr) {
+          qnn_interface_->interface.memDeRegister(&output_mem_handles[i], 1u);
+          output_mem_handles[i] = nullptr;
+        }
+        if (output_rpc_ptrs[i] != nullptr) {
+          rpcmem_free(output_rpc_ptrs[i]);
+          output_rpc_ptrs[i] = nullptr;
+        }
+      }
+    };
+
+    for (uint32_t out_i = 0; out_i < graph_info.num_of_output_tensors; out_i++) {
+      auto * out_tensor = &(io_tensors.outputs[out_i]);
+
+      // compute tensor size from dims
+      size_t element_cnt = 1;
+      for (uint32_t r = 0; r < out_tensor->v1.rank; r++) {
+        element_cnt *= out_tensor->v1.dimensions[r];
+      }
+      size_t bytes = element_cnt;
+      switch (out_tensor->v1.dataType) {
+        case QNN_DATATYPE_FLOAT_32:
+          bytes = element_cnt * sizeof(float);
+          break;
+        case QNN_DATATYPE_FLOAT_64:
+          bytes = element_cnt * sizeof(double);
+          break;
+        case QNN_DATATYPE_INT_8:
+        case QNN_DATATYPE_UINT_8:
+        case QNN_DATATYPE_UFIXED_POINT_8:
+        case QNN_DATATYPE_BOOL_8:
+          bytes = element_cnt * sizeof(uint8_t);
+          break;
+        case QNN_DATATYPE_UINT_16:
+        case QNN_DATATYPE_UFIXED_POINT_16:
+        case QNN_DATATYPE_INT_16:
+          bytes = element_cnt * sizeof(uint16_t);
+          break;
+        case QNN_DATATYPE_UINT_32:
+        case QNN_DATATYPE_INT_32:
+          bytes = element_cnt * sizeof(uint32_t);
+          break;
+        case QNN_DATATYPE_UINT_64:
+        case QNN_DATATYPE_INT_64:
+          bytes = element_cnt * sizeof(uint64_t);
+          break;
+        default:
+          // fall back
+          bytes = element_cnt;
+          break;
+      }
+
+      void * ptr = rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, static_cast<int>(bytes));
+      if (nullptr == ptr) {
+        QRB_ERROR("rpcmem_alloc for output failed");
+        cleanup_outputs();
+        ::dlclose(libCdspHandle);
+        qnn_interface_->interface.memDeRegister(&input_mem_handle, 1u);
+        return StatusCode::FAILURE;
+      }
+      int fd = rpcmem_to_fd(ptr);
+      if (fd < 0) {
+        QRB_ERROR("rpcmem_to_fd for output failed");
+        rpcmem_free(ptr);
+        cleanup_outputs();
+        ::dlclose(libCdspHandle);
+        qnn_interface_->interface.memDeRegister(&input_mem_handle, 1u);
+        return StatusCode::FAILURE;
+      }
+
+      Qnn_MemDescriptor_t out_mem_desc = QNN_MEM_DESCRIPTOR_INIT;
+      out_mem_desc.memShape = {out_tensor->v1.rank, out_tensor->v1.dimensions, nullptr};
+      out_mem_desc.dataType = out_tensor->v1.dataType;
+      out_mem_desc.memType = QNN_MEM_TYPE_ION;
+      out_mem_desc.ionInfo.fd = fd;
+
+      Qnn_MemHandle_t out_mem_handle = nullptr;
+      auto out_rc = qnn_interface_->interface.memRegister(context_, &out_mem_desc, 1u, &out_mem_handle);
+      if (QNN_SUCCESS != out_rc) {
+        const char * err_msg = nullptr;
+        qnn_interface_->interface.errorGetMessage(out_rc, &err_msg);
+        QRB_ERROR("memRegister(output ION) failed: ", (err_msg ? err_msg : "unknown"), " (", out_rc, ")");
+        rpcmem_free(ptr);
+        cleanup_outputs();
+        ::dlclose(libCdspHandle);
+        qnn_interface_->interface.memDeRegister(&input_mem_handle, 1u);
+        return StatusCode::FAILURE;
+      }
+
+      out_tensor->v1.memType = QNN_TENSORMEMTYPE_MEMHANDLE;
+      out_tensor->v1.memHandle = out_mem_handle;
+
+      output_mem_handles[out_i] = out_mem_handle;
+      output_rpc_ptrs[out_i] = ptr;
+      output_fds[out_i] = fd;
+    }
+
+    // Execute graph
+    QRB_DEBUG("=== About to execute graph ===");
+    QRB_DEBUG("Graph handle: ", graph_info.graph);
+    QRB_DEBUG("Num inputs: ", io_tensors.num_of_input_tensors);
+    QRB_DEBUG("Num outputs: ", io_tensors.num_of_output_tensors);
+    QRB_DEBUG("Input[0] memType: ", io_tensors.inputs[0].v1.memType);
+    QRB_DEBUG("Calling graphExecute...");
+
+    auto exec_rc = qnn_interface_->interface.graphExecute(graph_info.graph,
+                                  io_tensors.inputs, io_tensors.num_of_input_tensors,
+                                  io_tensors.outputs, io_tensors.num_of_output_tensors, nullptr,
+                                  nullptr);
+
+    QRB_DEBUG("graphExecute returned: ", exec_rc);
+
+    if (QNN_GRAPH_NO_ERROR != exec_rc) {
+      QRB_ERROR("QNN graphExecute failed with code: ", exec_rc);
+      cleanup_outputs();
+      ::dlclose(libCdspHandle);
+      qnn_interface_->interface.memDeRegister(&input_mem_handle, 1u);
+      return StatusCode::FAILURE;
+    }
+
+    QRB_DEBUG("graphExecute succeeded!");
+
+#ifndef __hexagon__
+    // Produce OutputTensor list with DMA-BUF metadata and no data copy.
+    QRB_DEBUG("=== Processing output tensors ===");
+    QRB_DEBUG("Number of output tensors: ", graph_info.num_of_output_tensors);
+
+    output_tensor_.clear();
+    output_tensor_.reserve(graph_info.num_of_output_tensors);
+
+    for (uint32_t out_i = 0; out_i < graph_info.num_of_output_tensors; out_i++) {
+      QRB_DEBUG("Processing output tensor ", out_i);
+      const auto * out_tensor = &(io_tensors.outputs[out_i]);
+      QRB_DEBUG("Output tensor rank: ", out_tensor->v1.rank);
+      QRB_DEBUG("Output tensor dataType: ", out_tensor->v1.dataType);
+      QRB_DEBUG("Output tensor name: ", (out_tensor->v1.name ? out_tensor->v1.name : "NULL"));
+      QRB_DEBUG("Output tensor dimensions pointer: ", out_tensor->v1.dimensions);
+
+      std::vector<size_t> shape;
+      if (out_tensor->v1.dimensions != nullptr) {
+        QRB_DEBUG("Reading dimensions...");
+        for (size_t r = 0; r < out_tensor->v1.rank; r++) {
+          QRB_DEBUG("  dim[", r, "] = ", out_tensor->v1.dimensions[r]);
+          shape.emplace_back(out_tensor->v1.dimensions[r]);
+        }
+      } else {
+        QRB_ERROR("Output tensor dimensions is NULL!");
+        cleanup_outputs();
+        ::dlclose(libCdspHandle);
+        qnn_interface_->interface.memDeRegister(&input_mem_handle, 1u);
+        return StatusCode::FAILURE;
+      }
+
+      QRB_DEBUG("Creating shape vector...");
+      int32_t qrb_dtype = -1;
+      switch (out_tensor->v1.dataType) {
+        case QNN_DATATYPE_UINT_8:
+        case QNN_DATATYPE_UFIXED_POINT_8:
+          qrb_dtype = 0;
+          break;
+        case QNN_DATATYPE_INT_8:
+          qrb_dtype = 1;
+          break;
+        case QNN_DATATYPE_FLOAT_32:
+          qrb_dtype = 2;
+          break;
+        case QNN_DATATYPE_FLOAT_64:
+          qrb_dtype = 3;
+          break;
+        default:
+          qrb_dtype = -1;
+          break;
+      }
+      QRB_DEBUG("qrb_dtype: ", qrb_dtype);
+
+      QRB_DEBUG("Creating OutputTensor struct...");
+      OutputTensor ot;
+      QRB_DEBUG("Setting output_tensor_name...");
+      ot.output_tensor_name = out_tensor->v1.name;
+      QRB_DEBUG("output_tensor_name set to: ", ot.output_tensor_name);
+
+      QRB_DEBUG("Converting shape vector...");
+      ot.output_tensor_shape.reserve(shape.size());
+      for (size_t i = 0; i < shape.size(); i++) {
+        ot.output_tensor_shape.push_back(static_cast<uint32_t>(shape[i]));
+      }
+      QRB_DEBUG("Shape vector converted, size: ", ot.output_tensor_shape.size());
+
+      ot.data_type = qrb_dtype;
+      QRB_DEBUG("data_type set to: ", ot.data_type);
+
+      // tensor data is in DMA-BUF
+      QRB_DEBUG("Setting output_dmabuf_fd...");
+      QRB_DEBUG("output_fds[", out_i, "] = ", output_fds[out_i]);
+      ot.output_dmabuf_fd = output_fds[out_i];
+      QRB_DEBUG("output_dmabuf_fd set to: ", ot.output_dmabuf_fd);
+
+      ot.output_dmabuf_offset = 0;
+      QRB_DEBUG("output_dmabuf_offset set to: 0");
+
+      // dmabuf size is the rpcmem allocation size, not necessarily exact tensor bytes; keep consistent with allocation
+      // compute bytes the same way as allocation
+      QRB_DEBUG("Computing output_dmabuf_size...");
+      size_t element_cnt = 1;
+      for (uint32_t r = 0; r < out_tensor->v1.rank; r++) {
+        QRB_DEBUG("  Multiplying by dim[", r, "] = ", out_tensor->v1.dimensions[r]);
+        element_cnt *= out_tensor->v1.dimensions[r];
+      }
+      QRB_DEBUG("element_cnt: ", element_cnt);
+
+      size_t bytes = element_cnt;
+      QRB_DEBUG("About to switch on dataType: ", out_tensor->v1.dataType);
+      switch (out_tensor->v1.dataType) {
+        case QNN_DATATYPE_FLOAT_32:
+          QRB_DEBUG("Case FLOAT_32");
+          bytes = element_cnt * sizeof(float);
+          QRB_DEBUG("bytes = ", bytes);
+          break;
+        case QNN_DATATYPE_FLOAT_64:
+          QRB_DEBUG("Case FLOAT_64");
+          bytes = element_cnt * sizeof(double);
+          break;
+        case QNN_DATATYPE_INT_8:
+        case QNN_DATATYPE_UINT_8:
+        case QNN_DATATYPE_UFIXED_POINT_8:
+        case QNN_DATATYPE_BOOL_8:
+          QRB_DEBUG("Case 8-bit");
+          bytes = element_cnt * sizeof(uint8_t);
+          break;
+        case QNN_DATATYPE_UINT_16:
+        case QNN_DATATYPE_UFIXED_POINT_16:
+        case QNN_DATATYPE_INT_16:
+          QRB_DEBUG("Case 16-bit");
+          bytes = element_cnt * sizeof(uint16_t);
+          break;
+        case QNN_DATATYPE_UINT_32:
+        case QNN_DATATYPE_INT_32:
+          QRB_DEBUG("Case 32-bit");
+          bytes = element_cnt * sizeof(uint32_t);
+          break;
+        case QNN_DATATYPE_UINT_64:
+        case QNN_DATATYPE_INT_64:
+          QRB_DEBUG("Case 64-bit");
+          bytes = element_cnt * sizeof(uint64_t);
+          break;
+        default:
+          QRB_DEBUG("Case default");
+          bytes = element_cnt;
+          break;
+      }
+      QRB_DEBUG("After switch, bytes = ", bytes);
+      QRB_DEBUG("Setting output_dmabuf_size...");
+      ot.output_dmabuf_size = static_cast<uint32_t>(bytes);
+      QRB_DEBUG("output_dmabuf_size set to: ", ot.output_dmabuf_size);
+
+      QRB_DEBUG("Adding to output_tensor_ vector...");
+      output_tensor_.emplace_back(std::move(ot));
+      QRB_DEBUG("Successfully added output tensor ", out_i);
+    }
+    QRB_DEBUG("Finished processing all output tensors");
+#endif
+
+    // Important: keep output DMA-BUF alive for downstream; do NOT free rpcmem here.
+    // Also do NOT memDeRegister output handles here because tensors refer to them.
+    // We only deregister input handle which is owned by caller.
+    QRB_DEBUG("About to memDeRegister input_mem_handle...");
+    auto dereg_rc = qnn_interface_->interface.memDeRegister(&input_mem_handle, 1u);
+    QRB_DEBUG("memDeRegister returned: ", dereg_rc);
+
+    // Close the dlopen handle; the allocated buffers remain valid.
+    QRB_DEBUG("About to dlclose libCdspHandle...");
+    ::dlclose(libCdspHandle);
+    QRB_DEBUG("dlclose completed");
+
+    // IMPORTANT: Manually free both input and output tensors to prevent destructor issues
+    // Input/output dimensions and names point to graph_info which is still valid
+    // We must prevent double-free by clearing these pointers before destructor runs
+
+    QRB_DEBUG("Manually freeing input tensors...");
+    for (uint32_t in_i = 0; in_i < graph_info.num_of_input_tensors; in_i++) {
+      // Clear all pointers that we don't own
+      io_tensors.inputs[in_i].v1.memType = QNN_TENSORMEMTYPE_RAW;
+      io_tensors.inputs[in_i].v1.clientBuf.data = nullptr;
+      io_tensors.inputs[in_i].v1.clientBuf.dataSize = 0;
+      io_tensors.inputs[in_i].v1.dimensions = nullptr;
+      io_tensors.inputs[in_i].v1.name = nullptr;
+    }
+    free(io_tensors.inputs);
+    io_tensors.inputs = nullptr;
+    io_tensors.num_of_input_tensors = 0;
+    QRB_DEBUG("Input tensors manually freed");
+
+    QRB_DEBUG("Manually freeing output tensors...");
+    for (uint32_t out_i = 0; out_i < graph_info.num_of_output_tensors; out_i++) {
+      // Clear all pointers that we don't own or want to keep
+      io_tensors.outputs[out_i].v1.memType = QNN_TENSORMEMTYPE_RAW;
+      io_tensors.outputs[out_i].v1.clientBuf.data = nullptr;
+      io_tensors.outputs[out_i].v1.clientBuf.dataSize = 0;
+      io_tensors.outputs[out_i].v1.dimensions = nullptr;
+      io_tensors.outputs[out_i].v1.name = nullptr;
+    }
+    free(io_tensors.outputs);
+    io_tensors.outputs = nullptr;
+    io_tensors.num_of_output_tensors = 0;
+    QRB_DEBUG("Output tensors manually freed");
+
+    // Save output handles for cleanup in next inference
+    prev_output_handles = std::move(output_mem_handles);
+    QRB_DEBUG("Saved ", prev_output_handles.size(), " output handles for next cleanup");
+
+    // NOTE: output buffers will leak unless we add lifetime management.
+    // For ROS demo verification, we rely on process lifetime. A production solution should track and free.
+  }
+
+  QRB_DEBUG("inference_execute_dmabuf returning SUCCESS");
+  return StatusCode::SUCCESS;
+}
+
 const std::vector<OutputTensor> QnnInference::get_output_tensors()
 {
   return std::move(output_tensor_);
@@ -407,30 +662,11 @@ void QnnInference::free_graphs_info()
 
 void QnnInference::free_context()
 {
-  if (context_ != nullptr) {
-    if (QNN_CONTEXT_NO_ERROR != qnn_interface_->interface.contextFree(context_, nullptr)) {
-      QRB_ERROR("Failed to free context!");
-    }
-    context_ = nullptr;
+  if (QNN_CONTEXT_NO_ERROR != qnn_interface_->interface.contextFree(context_, nullptr)) {
+    QRB_ERROR("Failed to free context!");
   }
 
-  // 释放 callback 相关资源（仅 binary 模型 + HTP + WithCallback 路径会分配）
-  if (context_binary_cb_ctx_) {
-    auto* ctx = reinterpret_cast<ContextBinaryCallbackCtx*>(context_binary_cb_ctx_.get());
-
-    if (ctx->model_fd >= 0) {
-      ::close(ctx->model_fd);
-      ctx->model_fd = -1;
-    }
-
-    // 正常情况下 QNN 会在 contextFree 过程中触发 dma_data_release，把 dmabufs 清空；
-    // 这里保留兜底，防止异常路径泄漏。
-    for (auto& kv : ctx->dmabufs) {
-      free_dmabuf(kv.second);
-    }
-    ctx->dmabufs.clear();
-    context_binary_cb_ctx_.reset();
-  }
+  context_ = nullptr;
 }
 
 void QnnInference::free_device()
@@ -640,85 +876,10 @@ StatusCode QnnInference::set_up_graph_info(const QnnSystemContext_BinaryInfo_t *
 StatusCode QnnInference::create_context_from_binary(const std::shared_ptr<uint8_t[]> model_buf,
     const uint64_t model_buf_size)
 {
-  const bool is_htp_backend = (backend_option_.find("HTP") != std::string::npos);
-
-  if (!is_htp_backend || !enable_context_create_callback_|| qnn_interface_->interface.contextCreateFromBinaryWithCallback == nullptr) {
-    if (qnn_interface_->interface.contextCreateFromBinary(backend_handle_, device_handle_, nullptr,
-            static_cast<void *>(model_buf.get()), model_buf_size, &context_, nullptr)) {
-      QRB_ERROR("Could not create context from binary!");
-      return StatusCode::FAILURE;
-    }
-  } else {
-    // HTP 优化路径：createFromBinaryWithCallback（external weights-loaded buffer）
-    // NOTE:
-    // - callback 依赖 DMA-BUF allocator；本仓库不引入平台 allocator，实现留在 allocate_dmabuf()
-    // - notifyParam 必须在 contextFree 前保持有效，因此保存到成员 context_binary_cb_ctx_
-    auto* rawCtx = new ContextBinaryCallbackCtx();
-    rawCtx->model_fd = ::open(model_path_.c_str(), O_RDONLY);
-    if (rawCtx->model_fd < 0) {
-      QRB_ERROR("Fail to open model file for callback provider: ", model_path_);
-      delete rawCtx;
-      return StatusCode::FAILURE;
-    }
-
-    // 用 unique_ptr<void,deleter> 持有，保证 notifyParam 生命周期覆盖 contextFree。
-    context_binary_cb_ctx_ = std::unique_ptr<void, void (*)(void*)>(
-        rawCtx, [](void* p) { delete reinterpret_cast<ContextBinaryCallbackCtx*>(p); });
-
-    Qnn_ContextBinaryCallback_t callback{};
-    callback.type = QNN_CONTEXT_CALLBACK_DMA_BUFFER;
-    callback.dmaBufferCallback.version = QNN_CONTEXT_CALLBACK_DMA_BUFFER_VERSION_1;
-    callback.dmaBufferCallback.v1.dataProvide = dma_data_provider;
-    callback.dmaBufferCallback.v1.dataRelease = dma_data_release;
-    callback.dmaBufferCallback.v1.notifyParam = rawCtx;
-
-    Qnn_SignalHandle_t signal = nullptr;
-    const Qnn_ErrorHandle_t err = qnn_interface_->interface.contextCreateFromBinaryWithCallback(
-        backend_handle_,
-        device_handle_,
-        nullptr,
-        &callback,
-        static_cast<void *>(model_buf.get()),
-        model_buf_size,
-        &context_,
-        nullptr,
-        signal);
-
-    if (err != QNN_SUCCESS) {
-      // create 失败时，QNN 未必触发 release 回调：做兜底释放
-      auto* failCtx = reinterpret_cast<ContextBinaryCallbackCtx*>(context_binary_cb_ctx_.get());
-      for (auto& kv : failCtx->dmabufs) {
-        free_dmabuf(kv.second);
-      }
-      failCtx->dmabufs.clear();
-      ::close(failCtx->model_fd);
-
-      QRB_DEBUG("[QNN-DMABUF] create failed: reqTotal=",
-                static_cast<uint64_t>(failCtx->total_requested_bytes),
-                " allocTotal=",
-                static_cast<uint64_t>(failCtx->total_allocated_bytes),
-                " maxAlloc=",
-                static_cast<uint64_t>(failCtx->max_single_alloc_bytes),
-                " numAllocs=",
-                static_cast<unsigned>(failCtx->num_allocs));
-
-      context_binary_cb_ctx_.reset();
-
-      QRB_ERROR("Could not create context from binary with callback! err=", err);
-      return StatusCode::FAILURE;
-    }
-
-    // create 成功后打印统计信息，便于验证：
-    // 1) 是否真的分配了 DMA-BUF（numAllocs>0 且 fd/addr 在 provider 日志中出现）
-    // 2) 分配总量/最大单块是多少
-    QRB_DEBUG("[QNN-DMABUF] create ok: reqTotal=",
-              static_cast<uint64_t>(rawCtx->total_requested_bytes),
-              " allocTotal=",
-              static_cast<uint64_t>(rawCtx->total_allocated_bytes),
-              " maxAlloc=",
-              static_cast<uint64_t>(rawCtx->max_single_alloc_bytes),
-              " numAllocs=",
-              static_cast<unsigned>(rawCtx->num_allocs));
+  if (qnn_interface_->interface.contextCreateFromBinary(backend_handle_, device_handle_, nullptr,
+          static_cast<void *>(model_buf.get()), model_buf_size, &context_, nullptr)) {
+    QRB_ERROR("Could not create context from binary!");
+    return StatusCode::FAILURE;
   }
 
   for (uint32_t i = 0; i < graphs_count_; i++) {

@@ -3,6 +3,8 @@
 
 #include "qrb_ros_nn_inference/qrb_ros_inference_node.hpp"
 
+#include <chrono>
+
 namespace qrb_ros::nn_inference
 {
 
@@ -41,9 +43,22 @@ void QrbRosInferenceNode::subscription_callback(const custom_msg::TensorList & m
   RCLCPP_INFO(this->get_logger(), "Got model input data, start executing inference...");
 
   const auto input_tensor = (msg.tensor_list)[0];
-  if (false == this->qrb_inference_mgr_->inference_execute(input_tensor.data)) {
-    RCLCPP_ERROR(this->get_logger(), "Inference execute fail!");
-    rclcpp::shutdown();
+
+  if (input_tensor.dmabuf_fd >= 0) {
+    RCLCPP_INFO(this->get_logger(),
+        "Using DMA-BUF input: fd=%d size=%u offset=%lu", input_tensor.dmabuf_fd,
+        input_tensor.dmabuf_size, input_tensor.dmabuf_offset);
+
+    if (false == this->qrb_inference_mgr_->inference_execute_dmabuf(
+            input_tensor.dmabuf_fd, input_tensor.dmabuf_size, input_tensor.dmabuf_offset)) {
+      RCLCPP_ERROR(this->get_logger(), "Inference execute (DMA-BUF) fail!");
+      rclcpp::shutdown();
+    }
+  } else {
+    if (false == this->qrb_inference_mgr_->inference_execute(input_tensor.data)) {
+      RCLCPP_ERROR(this->get_logger(), "Inference execute fail!");
+      rclcpp::shutdown();
+    }
   }
 
   RCLCPP_INFO(this->get_logger(), "Inference execute successfully!");
@@ -65,9 +80,22 @@ void QrbRosInferenceNode::publish_msg(custom_msg::TensorList pub_tensors)
     tensor.data_type = rt.data_type;
     tensor.name = rt.output_tensor_name;
     tensor.shape = rt.output_tensor_shape;
-    tensor.data = rt.output_tensor_data;
+
+    tensor.dmabuf_fd = rt.output_dmabuf_fd;
+    tensor.dmabuf_size = rt.output_dmabuf_size;
+    tensor.dmabuf_offset = rt.output_dmabuf_offset;
+
+    if (rt.output_dmabuf_fd < 0) {
+      tensor.data = rt.output_tensor_data;
+    }
+
     pub_tensors.tensor_list.emplace_back(std::move(tensor));
   }
+
+  // Print timestamp before publishing (millisecond precision)
+  auto now = std::chrono::system_clock::now();
+  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+  RCLCPP_INFO(this->get_logger(), "[TIMESTAMP] Before publish: %ld ms", ms);
 
   RCLCPP_INFO(this->get_logger(), "Publish the inference result...");
   this->pub_->publish(std::move(pub_tensors));
