@@ -20,11 +20,9 @@ set(SOURCES
   src/qrb_inference_manager.cpp
   src/qnn_inference/qnn_inference.cpp
   src/qnn_inference/qnn_inference_impl.cpp
-  src/qnn_delegate_inference/qnn_delegate_inference.cpp
 )
 
 ament_auto_add_library(qrb_inference_manager SHARED ${SOURCES})
-target_link_libraries(qrb_inference_manager tensorflowlite_c QnnTFLiteDelegate)
 
 set_target_properties(
   qrb_inference_manager PROPERTIES

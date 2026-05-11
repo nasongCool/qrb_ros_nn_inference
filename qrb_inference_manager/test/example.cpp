@@ -8,9 +8,6 @@
 
 int main()
 {
-  // std::string model_path{"model.tflite"};
-  // std::string backend_option{"gpu"};
-
   // std::string model_path{"model.bin"};
   // std::string backend_option{"libQnnHtp.so"};
 

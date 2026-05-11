@@ -4,14 +4,13 @@
 
 #include <stdexcept>
 
-#include "qnn_delegate_inference/qnn_delegate_inference.hpp"
 #include "qnn_inference/qnn_inference.hpp"
 
 namespace qrb::inference_mgr
 {
 
 /**
- * \brief initialize qrb_inference_ to QnnInference or QnnDelegateInference
+ * \brief initialize qrb_inference_ to QnnInference
  * \param backend_option backend lib of QNN
  * \param model_path path of model
  * \throw std::logic_error, if param not meet requirement
@@ -21,17 +20,12 @@ QrbInferenceManager::QrbInferenceManager(const std::string & model_path,
 {
   auto is_so_model = (std::string::npos != model_path.find(".so"));
   auto is_bin_model = (std::string::npos != model_path.find(".bin"));
-  auto is_tflite_model = (std::string::npos != model_path.find(".tflite"));
 
-  if (!is_so_model && !is_bin_model && !is_tflite_model) {
+  if (!is_so_model && !is_bin_model) {
     throw std::logic_error("ERROR: Model format NOT support!");
   }
 
-  if (is_tflite_model) {
-    qrb_inference_ = std::make_unique<QnnDelegateInference>(model_path, backend_option);
-  } else {
-    qrb_inference_ = std::make_unique<QnnInference>(model_path, backend_option);
-  }
+  qrb_inference_ = std::make_unique<QnnInference>(model_path, backend_option);
 
   if (qrb_inference_->inference_init() != StatusCode::SUCCESS) {
     throw std::logic_error("ERROR: Inference init fail!");
